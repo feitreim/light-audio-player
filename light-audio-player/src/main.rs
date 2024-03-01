@@ -1,8 +1,9 @@
-use std::{env, vec::Vec, thread, io, time::Duration,};
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::{env, vec::Vec, thread, io, 
+    time::Duration, path::{Path, PathBuf}, 
+    sync::mpsc::{channel, Sender, Receiver},
+    fs::{File, read_dir}, };
 use rand::{seq::SliceRandom, thread_rng};
-use std::fs::{File, read_dir};
-use rodio::{Decoder, OutputStream, Sink, source::Source};
+use rodio::{Decoder, OutputStream, Sink};
 
 // ---------------------- Constants ---------------------
 const VOLUME_ADJUSTMENT: f32 = 0.1f32;
@@ -30,13 +31,12 @@ enum Contents {
 }
 
 enum Origin {
-    Player,
     LifeSupport,
     Input,
 }
 
 // ---------------------- non-thread functions ----------
-fn play_song(sink: &Sink, song:&mut String) -> Result<(), io::Error> {
+fn play_song(sink: &Sink, song: &Path) -> Result<(), io::Error> {
     //! Add a song to the sink
     let file = io::BufReader::new(File::open(song).unwrap());
     let source = Decoder::new(file).unwrap();
@@ -44,18 +44,19 @@ fn play_song(sink: &Sink, song:&mut String) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn shuffle_and_queue(sink: &Sink, songs: &mut [String]) {
+fn shuffle_and_queue(sink: &Sink, songs: &mut [PathBuf]) {
     let mut rng = thread_rng();
     songs.shuffle(&mut rng);
     for song in songs {
-        if let Err(_e) = play_song(sink, song) { 
-            println!("song {} unable to be added to the queue.", song)
+        let song_cow = song.as_path();
+        if let Err(_e) = play_song(sink, song_cow) { 
+            println!("song {} unable to be added to the queue.", song_cow.display())
         }
     }
 }
 
 // ------------------ Thread functions -------------------
-fn player(to_input: Sender<usize>, to_ls: Sender<usize>, rcv: Receiver<Message>, sink: Sink, songs: &mut [String]) -> Result<(), io::Error> {
+fn player(to_input: Sender<usize>, to_ls: Sender<usize>, rcv: Receiver<Message>, sink: Sink, songs: &mut [PathBuf]) -> Result<(), io::Error> {
     //! thread fn to run the sink, waits for input in the form
     //! of a message to reciever telling it what to do.
     //! starts by queing all the songs.
@@ -85,7 +86,7 @@ fn player(to_input: Sender<usize>, to_ls: Sender<usize>, rcv: Receiver<Message>,
                 // send the length of the queue back to the right place.
                 match msg.origin {
                     Origin::LifeSupport => to_ls.send(sink.len()).unwrap(),
-                    _ => (),
+                    Origin::Input => to_input.send(sink.len()).unwrap(),
                 }
             },
         };
@@ -95,13 +96,37 @@ fn player(to_input: Sender<usize>, to_ls: Sender<usize>, rcv: Receiver<Message>,
 }
 
 fn input_thread(to: Sender<Message>, rcv: Receiver<usize>) -> Result<(), io::Error> {
+    //! input thread function, prompts the user for input and 
+    //! receives said input.
     let stdin = io::stdin();
     let mut buf = String::new();
     loop {
         if let Err(_e) = to.send(Message::new(Contents::HowMany, Origin::LifeSupport)) {
             break;
         }
-        stdin.read_line(&mut buf).unwrap();
+        print!("Actions: \n
+                 \t* p: play\n
+                 \t* =: pause\n
+                 \t* stop: stop. quit. end..\n
+                 \t* s: skip\n
+                 \t* +: volume up by 10%, can go above 100%\n
+                 \t* -: volume down by 10%, min 0%.\n
+                 \t* q: how many songs are in the queue\n
+                 (type): ");
+        stdin.read_line(&mut buf)?;
+        match buf.as_str() {
+            "p" => to.send(Message::new(Contents::Play, Origin::Input)).unwrap(),
+            "=" => to.send(Message::new(Contents::Pause, Origin::Input)).unwrap(), 
+            "stop" => to.send(Message::new(Contents::Stop, Origin::Input)).unwrap(), 
+            "s" => to.send(Message::new(Contents::Skip, Origin::Input)).unwrap(), 
+            "+" => to.send(Message::new(Contents::VUp, Origin::Input)).unwrap(), 
+            "-" => to.send(Message::new(Contents::VDown, Origin::Input)).unwrap(), 
+            "q" => { 
+                to.send(Message::new(Contents::HowMany, Origin::Input)).unwrap();
+                println!( "there are {} songs until they will be shuffled again.", rcv.recv().unwrap() ) 
+            }, 
+            &_ => todo!(),
+        }
     }
     Ok(())
 }
@@ -122,6 +147,7 @@ fn life_support_thread(to: Sender<Message>, rcv: Receiver<usize>) -> Result<(), 
 }
 
 // ------------------ Main --------------------
+
 fn main() -> Result<(), io::Error> {
     // take args
     let args: Vec<String> = env::args().collect();
@@ -132,20 +158,30 @@ fn main() -> Result<(), io::Error> {
     let mut paths = read_dir(dir_path).unwrap()
         .map(|dir| dir.map(|f| f.path()))
         .collect::<Result<Vec<_>, io::Error>>()?;
-    let songs = paths.as_mut_slice();
     
     // open output stream.
     let (_stream, stream_handle) = OutputStream::try_default().unwrap();
     let sink = Sink::try_new(&stream_handle).unwrap();
 
     // open thread resources
-    let (to_sink, rcv_sink) = channel::<Message>();
-    let (to_queue, rcv_queue) = channel::<usize>();
+    let (to_player, rcv_player) = channel::<Message>();
+    let (to_life_support, rcv_queue) = channel::<usize>();
     let (to_input, rcv_input) = channel::<usize>();
 
     // open stdin for taking input
-
-    sink.sleep_until_end();
-
+    let player_handle = thread::spawn(move | | {
+        let _ = player(to_input, to_life_support, rcv_player, sink, paths.as_mut_slice());
+    });
+    let to_player_clone = to_player.clone();
+    let input_handle = thread::spawn(move | | {
+        let _ = input_thread(to_player_clone, rcv_input);
+    });
+    let life_support_handle = thread::spawn(move | | {
+        let _ = life_support_thread(to_player, rcv_queue);
+    });
+    
+    player_handle.join().expect("player thread errored");
+    input_handle.join().expect("input thread errored");
+    life_support_handle.join().expect("life support errored");
     Ok(())
 }
